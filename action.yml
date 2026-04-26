@@ -1,0 +1,138 @@
+name: Create Signed Commit
+description: Create a server-signed (verified) commit via the GitHub Git Data API using a pre-minted GitHub App installation token.
+
+inputs:
+  github_token:
+    description: "GitHub App installation token (e.g. from actions/create-github-app-token). Needs `contents: write`."
+    required: true
+  commit_message:
+    description: Commit message headline.
+    required: true
+  branch:
+    description: Target branch. Defaults to GITHUB_HEAD_REF or GITHUB_REF_NAME.
+    required: false
+    default: ""
+  repository:
+    description: Target repository in `owner/repo` form. Defaults to GITHUB_REPOSITORY.
+    required: false
+    default: ""
+  files:
+    description: |
+      Newline-separated list of paths to commit. If empty, paths are discovered with
+      `git ls-files --modified --others --exclude-standard`. Missing paths are committed as deletions.
+    required: false
+    default: ""
+  working_directory:
+    description: Working directory for git commands. Defaults to the workflow workspace.
+    required: false
+    default: ""
+
+outputs:
+  sha:
+    description: SHA of the created commit. Empty when there are no changes.
+    value: ${{ steps.commit.outputs.result }}
+
+runs:
+  using: composite
+  steps:
+    - id: commit
+      uses: actions/github-script@v9
+      env:
+        INPUT_BRANCH: ${{ inputs.branch }}
+        INPUT_REPOSITORY: ${{ inputs.repository }}
+        INPUT_FILES: ${{ inputs.files }}
+        INPUT_MESSAGE: ${{ inputs.commit_message }}
+        INPUT_CWD: ${{ inputs.working_directory }}
+      with:
+        github-token: ${{ inputs.github_token }}
+        result-encoding: string
+        script: |
+          const fs = require('node:fs/promises');
+          const { execSync } = require('node:child_process');
+
+          const cwd = process.env.INPUT_CWD || process.cwd();
+          const branch =
+            process.env.INPUT_BRANCH ||
+            process.env.GITHUB_HEAD_REF ||
+            process.env.GITHUB_REF_NAME;
+          if (!branch) {
+            core.setFailed('Could not resolve target branch.');
+            return '';
+          }
+
+          let owner = context.repo.owner;
+          let repo = context.repo.repo;
+          if (process.env.INPUT_REPOSITORY) {
+            const [o, r] = process.env.INPUT_REPOSITORY.split('/');
+            if (!o || !r) {
+              core.setFailed("`repository` must be in 'owner/repo' form.");
+              return '';
+            }
+            owner = o;
+            repo = r;
+          }
+
+          let files = process.env.INPUT_FILES
+            .split('\n')
+            .map(s => s.trim())
+            .filter(Boolean);
+          if (files.length === 0) {
+            const out = execSync(
+              'git ls-files --modified --others --exclude-standard',
+              { cwd, encoding: 'utf8' },
+            );
+            files = out.split('\n').map(s => s.trim()).filter(Boolean);
+          }
+
+          if (files.length === 0) {
+            core.notice('No changes to commit.');
+            return '';
+          }
+
+          const tree = [];
+          for (const path of files) {
+            const abs = `${cwd}/${path}`;
+            try {
+              const stat = await fs.stat(abs);
+              if (!stat.isFile()) {
+                continue;
+              }
+              const content = await fs.readFile(abs, { encoding: 'base64' });
+              const blob = await github.rest.git.createBlob({
+                owner, repo, content, encoding: 'base64',
+              });
+              const mode = (stat.mode & 0o111) ? '100755' : '100644';
+              tree.push({ path, mode, type: 'blob', sha: blob.data.sha });
+            } catch (e) {
+              if (e.code !== 'ENOENT') {
+                throw e;
+              }
+              tree.push({ path, mode: '100644', sha: null });
+            }
+          }
+
+          const ref = await github.rest.git.getRef({
+            owner, repo, ref: `heads/${branch}`,
+          });
+          const baseSha = ref.data.object.sha;
+          const baseCommit = await github.rest.git.getCommit({
+            owner, repo, commit_sha: baseSha,
+          });
+
+          const newTree = await github.rest.git.createTree({
+            owner, repo, base_tree: baseCommit.data.tree.sha, tree,
+          });
+
+          const newCommit = await github.rest.git.createCommit({
+            owner, repo,
+            message: process.env.INPUT_MESSAGE,
+            tree: newTree.data.sha,
+            parents: [baseSha],
+          });
+
+          await github.rest.git.updateRef({
+            owner, repo, ref: `heads/${branch}`, sha: newCommit.data.sha,
+          });
+
+          core.info(`Created verified commit ${newCommit.data.sha} on ${owner}/${repo}@${branch}`);
+          return newCommit.data.sha;
